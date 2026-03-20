@@ -1,9 +1,10 @@
 // ============================================================
-// yandex-realtime-proxy.js v2
+// yandex-realtime-proxy.js v3
 // 
 // WebSocket-прокси: Voximplant ↔ Yandex AI Studio Realtime API
 //
-// v2: silence frames чтобы медиа-мост Voximplant не рвался
+// v3 fix: VoxEngine sendMediaBetween шлёт аудио как text frames,
+// не binary. Определяем аудио по содержимому, не по isBinary.
 // ============================================================
 
 const http = require("http");
@@ -18,17 +19,13 @@ const YANDEX_MODEL = `gpt://${YANDEX_FOLDER_ID}/speech-realtime-250923`;
 const YANDEX_WS_URL = `wss://rest-assistant.api.cloud.yandex.net/v1/realtime/openai?model=${YANDEX_MODEL}`;
 const YANDEX_HEADERS = { Authorization: `api-key ${YANDEX_API_KEY}` };
 
-// Edge Functions URLs
 const GET_SLOTS_URL = "https://nxtkthfhulkpaovilqlx.supabase.co/functions/v1/voice-agent-get-slots";
 const CREATE_BOOKING_URL = "https://nxtkthfhulkpaovilqlx.supabase.co/functions/v1/voice-agent-create-booking";
 const SEND_INFO_URL = "https://nxtkthfhulkpaovilqlx.supabase.co/functions/v1/voice-agent-send-info";
 
-// Голос и аудио
 const VOICE = process.env.YANDEX_VOICE || "kirill";
 const AUDIO_RATE = 24000;
-
-// Silence frame: 20ms тишины при 24kHz mono PCM16 = 480 samples * 2 bytes = 960 bytes
-const SILENCE_FRAME = Buffer.alloc(960);
+const SILENCE_FRAME = Buffer.alloc(960); // 20ms тишины при 24kHz mono PCM16
 
 // ==== HTTP-сервер ====
 const server = http.createServer((req, res) => {
@@ -36,7 +33,7 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({
     status: "ok",
     service: "yandex-realtime-proxy",
-    version: "2.0",
+    version: "3.0",
     yandex_model: YANDEX_MODEL,
     voice: VOICE,
   }));
@@ -58,10 +55,10 @@ wss.on("connection", async (voxWs, req) => {
   let yandexConnected = false;
   let silenceInterval = null;
   let gotFirstAudio = false;
+  let audioChunkCount = 0;
   const audioBuffer = [];
 
-  // ── Сразу начинаем слать тишину в Voximplant ──
-  // Критично: без аудио-фреймов VoxEngine закрывает медиа-мост
+  // ── Тишина в Voximplant пока Яндекс грузится ──
   silenceInterval = setInterval(() => {
     if (voxWs.readyState === WebSocket.OPEN && !gotFirstAudio) {
       voxWs.send(SILENCE_FRAME);
@@ -71,12 +68,8 @@ wss.on("connection", async (voxWs, req) => {
     }
   }, 20);
 
-  // Таймаут: остановить тишину через 10 секунд в любом случае
   const silenceTimeout = setTimeout(() => {
-    if (silenceInterval) {
-      clearInterval(silenceInterval);
-      silenceInterval = null;
-    }
+    if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
   }, 10000);
 
   // ── Подключение к Яндексу ──
@@ -93,7 +86,6 @@ wss.on("connection", async (voxWs, req) => {
     console.log("[PROXY] Connected to Yandex Realtime API");
     yandexConnected = true;
 
-    // Формируем контекст
     const today = new Date();
     const days = ["воскресенье","понедельник","вторник","среда","четверг","пятница","суббота"];
     const dateStr = today.toISOString().split("T")[0];
@@ -117,8 +109,7 @@ wss.on("connection", async (voxWs, req) => {
       contextParts.join(" ")
     );
 
-    // session.update
-    const sessionUpdate = {
+    yandexWs.send(JSON.stringify({
       type: "session.update",
       session: {
         instructions: systemPrompt,
@@ -126,11 +117,7 @@ wss.on("connection", async (voxWs, req) => {
         audio: {
           input: {
             format: { type: "audio/pcm", rate: AUDIO_RATE, channels: 1 },
-            turn_detection: {
-              type: "server_vad",
-              threshold: 0.5,
-              silence_duration_ms: 400,
-            },
+            turn_detection: { type: "server_vad", threshold: 0.5, silence_duration_ms: 400 },
           },
           output: {
             format: { type: "audio/pcm", rate: AUDIO_RATE },
@@ -139,97 +126,83 @@ wss.on("connection", async (voxWs, req) => {
         },
         tools: [
           {
-            type: "function",
-            name: "get_available_slots",
-            description: "Получить доступные слоты для записи на услугу массажа. Вызывай когда клиент хочет записаться.",
-            parameters: {
-              type: "object",
-              properties: {
-                service: { type: "string", description: "Название услуги" },
-                date: { type: "string", description: "Дата в формате YYYY-MM-DD" },
-              },
-              required: ["service", "date"],
-              additionalProperties: false,
-            },
+            type: "function", name: "get_available_slots",
+            description: "Получить доступные слоты для записи на услугу массажа.",
+            parameters: { type: "object", properties: { service: { type: "string" }, date: { type: "string" } }, required: ["service", "date"], additionalProperties: false },
           },
           {
-            type: "function",
-            name: "book_appointment",
-            description: "Создать запись клиента на услугу. Вызывай после подтверждения времени клиентом.",
-            parameters: {
-              type: "object",
-              properties: {
-                service: { type: "string" },
-                date: { type: "string" },
-                time: { type: "string" },
-                client_name: { type: "string" },
-              },
-              required: ["service", "date", "time", "client_name"],
-              additionalProperties: false,
-            },
+            type: "function", name: "book_appointment",
+            description: "Создать запись клиента на услугу.",
+            parameters: { type: "object", properties: { service: { type: "string" }, date: { type: "string" }, time: { type: "string" }, client_name: { type: "string" } }, required: ["service", "date", "time", "client_name"], additionalProperties: false },
           },
           {
-            type: "function",
-            name: "send_info",
+            type: "function", name: "send_info",
             description: "Отправить клиенту информацию по SMS или Telegram.",
-            parameters: {
-              type: "object",
-              properties: {
-                channel: { type: "string", enum: ["sms", "telegram"] },
-                content_type: { type: "string", enum: ["price_list", "address", "booking_link"] },
-                phone: { type: "string" },
-              },
-              required: ["channel", "content_type"],
-              additionalProperties: false,
-            },
+            parameters: { type: "object", properties: { channel: { type: "string", enum: ["sms", "telegram"] }, content_type: { type: "string", enum: ["price_list", "address", "booking_link"] }, phone: { type: "string" } }, required: ["channel", "content_type"], additionalProperties: false },
           },
           {
-            type: "function",
-            name: "forward_to_manager",
+            type: "function", name: "forward_to_manager",
             description: "Переключить звонок на живого администратора студии.",
-            parameters: {
-              type: "object",
-              properties: {
-                reason: { type: "string", description: "Причина перевода" },
-              },
-              required: ["reason"],
-              additionalProperties: false,
-            },
+            parameters: { type: "object", properties: { reason: { type: "string" } }, required: ["reason"], additionalProperties: false },
           },
         ],
       },
-    };
-
-    yandexWs.send(JSON.stringify(sessionUpdate));
+    }));
     console.log("[PROXY] Sent session.update to Yandex");
 
-    // Flush buffered audio
     while (audioBuffer.length > 0) {
-      const pcm = audioBuffer.shift();
-      sendAudioToYandex(pcm);
+      sendAudioToYandex(audioBuffer.shift());
     }
   });
 
-  // ── Voximplant → Яндекс (аудио) ──
+  // ── Voximplant → Яндекс ──
   function sendAudioToYandex(pcmData) {
     if (yandexConnected && yandexWs && yandexWs.readyState === WebSocket.OPEN) {
-      const b64 = pcmData.toString("base64");
+      const b64 = Buffer.from(pcmData).toString("base64");
       yandexWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
     }
   }
 
+  // КЛЮЧЕВОЙ FIX v3: VoxEngine sendMediaBetween шлёт аудио как текст
+  // Определяем тип по содержимому, не по isBinary
   voxWs.on("message", (data, isBinary) => {
-    if (isBinary) {
-      if (yandexConnected) {
-        sendAudioToYandex(Buffer.from(data));
-      } else {
-        audioBuffer.push(Buffer.from(data));
-      }
-    } else {
+    const raw = Buffer.from(data);
+
+    // Пробуем распарсить как JSON
+    // Если это JSON с полем "type" — это команда от VoxEngine
+    // Если не JSON — это аудио (PCM)
+    if (!isBinary) {
       try {
-        const cmd = JSON.parse(data.toString());
-        console.log("[PROXY] VoxEngine cmd:", cmd.type || cmd.action || "unknown");
-      } catch (e) {}
+        const str = raw.toString("utf8");
+        // Быстрая проверка: JSON всегда начинается с { или [
+        if (str.length > 0 && (str[0] === '{' || str[0] === '[')) {
+          const cmd = JSON.parse(str);
+          if (cmd.type || cmd.action) {
+            // Это JSON-команда
+            if (audioChunkCount === 0) {
+              console.log("[PROXY] VoxEngine JSON cmd:", cmd.type || cmd.action);
+            }
+            return;
+          }
+        }
+      } catch (e) {
+        // Не JSON — значит это аудио данные
+      }
+    }
+
+    // Это аудио (binary или не-JSON text)
+    audioChunkCount++;
+    if (audioChunkCount === 1) {
+      console.log(`[PROXY] First audio chunk received: ${raw.length} bytes, isBinary=${isBinary}`);
+    }
+    if (audioChunkCount % 500 === 0) {
+      console.log(`[PROXY] Audio chunks: ${audioChunkCount}`);
+    }
+
+    if (yandexConnected) {
+      sendAudioToYandex(raw);
+    } else {
+      audioBuffer.push(raw);
     }
   });
 
@@ -239,15 +212,12 @@ wss.on("connection", async (voxWs, req) => {
       const msg = JSON.parse(data.toString());
       const msgType = msg.type;
 
-      // Аудио от агента → binary PCM в Voximplant
       if (msgType === "response.output_audio.delta") {
         if (msg.delta && voxWs.readyState === WebSocket.OPEN) {
           if (!gotFirstAudio) {
             gotFirstAudio = true;
-            if (silenceInterval) {
-              clearInterval(silenceInterval);
-              silenceInterval = null;
-            }
+            console.log("[PROXY] First audio from Yandex — stopping silence");
+            if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
           }
           const pcmBuf = Buffer.from(msg.delta, "base64");
           voxWs.send(pcmBuf);
@@ -255,7 +225,6 @@ wss.on("connection", async (voxWs, req) => {
         return;
       }
 
-      // Распознанный текст пользователя
       if (msgType === "conversation.item.input_audio_transcription.completed") {
         const transcript = msg.transcript || "";
         if (transcript) {
@@ -265,28 +234,24 @@ wss.on("connection", async (voxWs, req) => {
         return;
       }
 
-      // Текст ответа агента
       if (msgType === "response.output_text.delta") {
         const delta = msg.delta || "";
         if (delta) console.log(`[AGENT] ${delta}`);
         return;
       }
 
-      // Начало речи пользователя → прерывание
       if (msgType === "input_audio_buffer.speech_started") {
         console.log("[PROXY] Speech started — interruption");
         safeSendJson(voxWs, { type: "interruption" });
         return;
       }
 
-      // Сессия создана
       if (msgType === "session.created") {
         const sid = (msg.session || {}).id;
         console.log(`[PROXY] Session created: ${sid}`);
         return;
       }
 
-      // Сессия обновлена
       if (msgType === "session.updated") {
         const tools = (msg.session || {}).tools || [];
         console.log(`[PROXY] Session updated, tools: ${tools.length}`);
@@ -294,7 +259,6 @@ wss.on("connection", async (voxWs, req) => {
         return;
       }
 
-      // Function call завершён
       if (msgType === "response.output_item.done") {
         const item = msg.item || {};
         if (item.type === "function_call") {
@@ -303,8 +267,8 @@ wss.on("connection", async (voxWs, req) => {
         return;
       }
 
-      // Ответ завершён — возобновляем тишину на паузу
       if (msgType === "response.done") {
+        console.log("[PROXY] Response done — resuming silence");
         gotFirstAudio = false;
         if (!silenceInterval) {
           silenceInterval = setInterval(() => {
@@ -316,22 +280,17 @@ wss.on("connection", async (voxWs, req) => {
             }
           }, 20);
           setTimeout(() => {
-            if (silenceInterval) {
-              clearInterval(silenceInterval);
-              silenceInterval = null;
-            }
+            if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
           }, 10000);
         }
         return;
       }
 
-      // Ошибка
       if (msgType === "error") {
         console.error("[YANDEX ERROR]", JSON.stringify(msg, null, 2));
         return;
       }
 
-      // Другие события
       if (!["response.created", "response.output_item.added",
            "response.content_part.added", "response.content_part.done",
            "input_audio_buffer.committed", "input_audio_buffer.commit",
@@ -349,47 +308,34 @@ wss.on("connection", async (voxWs, req) => {
     const callId = item.call_id;
     const funcName = item.name || "unknown";
     const argsText = item.arguments || "{}";
-
     let args = {};
     try { args = JSON.parse(argsText); } catch (e) { args = {}; }
 
     console.log(`[TOOL] ${funcName}(${JSON.stringify(args)})`);
 
     if (funcName === "forward_to_manager") {
-      console.log("[TOOL] Forward to manager — sending to VoxEngine");
-      safeSendJson(vWs, {
-        type: "forward_to_manager",
-        reason: args.reason || "Клиент попросил администратора",
-        call_id: callId,
-      });
-      sendFunctionResult(yWs, callId, JSON.stringify({ status: "transferring", message: "Переключаю на администратора" }));
+      safeSendJson(vWs, { type: "forward_to_manager", reason: args.reason || "Клиент попросил администратора", call_id: callId });
+      sendFunctionResult(yWs, callId, JSON.stringify({ status: "transferring" }));
       return;
     }
 
-    let url = "";
-    let body = {};
-
+    let fetchUrl = "", body = {};
     if (funcName === "get_available_slots") {
-      url = GET_SLOTS_URL;
+      fetchUrl = GET_SLOTS_URL;
       body = { service: args.service, date: args.date };
     } else if (funcName === "book_appointment") {
-      url = CREATE_BOOKING_URL;
+      fetchUrl = CREATE_BOOKING_URL;
       body = { service: args.service, date: args.date, time: args.time, client_name: args.client_name, client_phone: phone };
     } else if (funcName === "send_info") {
-      url = SEND_INFO_URL;
+      fetchUrl = SEND_INFO_URL;
       body = { channel: args.channel, content_type: args.content_type, phone: args.phone || phone };
     } else {
-      console.log(`[TOOL] Unknown function: ${funcName}`);
       sendFunctionResult(yWs, callId, JSON.stringify({ error: "Unknown function" }));
       return;
     }
 
     try {
-      const resp = await fetch(url, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(body),
-      });
+      const resp = await fetch(fetchUrl, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
       const result = await resp.text();
       console.log(`[TOOL] ${funcName} → ${resp.status}: ${result.substring(0, 200)}`);
       sendFunctionResult(yWs, callId, result);
@@ -401,12 +347,9 @@ wss.on("connection", async (voxWs, req) => {
 
   function sendFunctionResult(yWs, callId, output) {
     if (yWs && yWs.readyState === WebSocket.OPEN) {
-      yWs.send(JSON.stringify({
-        type: "conversation.item.create",
-        item: { type: "function_call_output", call_id: callId, output: output },
-      }));
+      yWs.send(JSON.stringify({ type: "conversation.item.create", item: { type: "function_call_output", call_id: callId, output: output } }));
       yWs.send(JSON.stringify({ type: "response.create" }));
-      console.log(`[TOOL] Result sent, requested response.create`);
+      console.log(`[TOOL] Result sent, response.create`);
     }
   }
 
@@ -421,9 +364,8 @@ wss.on("connection", async (voxWs, req) => {
     clearTimeout(silenceTimeout);
   }
 
-  // ── Закрытие соединений ──
   voxWs.on("close", (code) => {
-    console.log(`[PROXY] Voximplant disconnected: ${code}`);
+    console.log(`[PROXY] Voximplant disconnected: ${code}, audio chunks received: ${audioChunkCount}`);
     cleanup();
     if (yandexWs && yandexWs.readyState === WebSocket.OPEN) yandexWs.close();
   });
@@ -435,21 +377,20 @@ wss.on("connection", async (voxWs, req) => {
   });
 
   voxWs.on("error", (err) => {
-    console.error("[PROXY] Voximplant WS error:", err.message);
+    console.error("[PROXY] Vox error:", err.message);
     cleanup();
     if (yandexWs && yandexWs.readyState === WebSocket.OPEN) yandexWs.close();
   });
 
   yandexWs.on("error", (err) => {
-    console.error("[PROXY] Yandex WS error:", err.message);
+    console.error("[PROXY] Yandex error:", err.message);
     cleanup();
     if (voxWs.readyState === WebSocket.OPEN) voxWs.close(1011, "Yandex error");
   });
 });
 
-// ==== Запуск ====
 server.listen(PORT, () => {
-  console.log(`[PROXY] Yandex Realtime proxy v2 running on port ${PORT}`);
+  console.log(`[PROXY] Yandex Realtime proxy v3 running on port ${PORT}`);
   console.log(`[PROXY] Model: ${YANDEX_MODEL}`);
   console.log(`[PROXY] Voice: ${VOICE}`);
 });
