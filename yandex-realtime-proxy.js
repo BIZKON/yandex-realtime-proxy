@@ -1,9 +1,12 @@
 // ============================================================
-// yandex-realtime-proxy.js v12
+// yandex-realtime-proxy.js v12.1
 //
+// FIXES vs v12:
+// - Removed response.cancel on barge-in (Yandex error: illegal in USER_SPEAKING state)
+// - Yandex handles barge-in internally; proxy just mutes audio forwarding
 // FIXES vs v11:
 // 1. VAD: silence_duration_ms 400→800, threshold 0.5→0.6
-// 2. Barge-in: response.cancel + flush audio queue on speech_started
+// 2. Barge-in: muteOutput flag stops audio forwarding on speech_started
 // 3. end_call tool: agent can terminate the call
 // 4. Configurable voice via env (YANDEX_VOICE)
 // 5. Better logging with timestamps
@@ -164,7 +167,7 @@ function log(tag, msg) {
 // ── HTTP server (health check + keep-alive) ─────────────────
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", version: "12.0", voice: VOICE }));
+  res.end(JSON.stringify({ status: "ok", version: "12.1", voice: VOICE }));
 });
 
 // ── WebSocket server ────────────────────────────────────────
@@ -184,6 +187,7 @@ wss.on("connection", async (voxWs, req) => {
   let inputChunks = 0;
   let sentStartToVox = false;
   let agentSpeaking = false;      // FIX #2: track if agent is currently speaking
+  let muteOutput = false;         // FIX #2: mute audio output after barge-in
   let pendingAudioQueue = [];     // FIX #2: queue for outgoing audio frames
 
   // ── Connect to Yandex ───────────────────────────────────
@@ -472,15 +476,16 @@ wss.on("connection", async (voxWs, req) => {
       log("PROXY", `Updated, tools=${toolCount}`);
 
     // ── FIX #2: Barge-in ──────────────────────────────────
+    // Yandex handles barge-in internally (unlike OpenAI which needs response.cancel)
+    // We just stop forwarding agent audio to VoxEngine so user hears silence
     } else if (t === "input_audio_buffer.speech_started") {
-      log("PROXY", "Speech started");
-
-      // If agent is currently speaking, cancel the response
       if (agentSpeaking) {
-        log("PROXY", ">>> BARGE-IN: cancelling agent response");
-        yaWs.send(JSON.stringify({ type: "response.cancel" }));
-        agentSpeaking = false;
+        log("PROXY", ">>> BARGE-IN: muting agent audio");
+        muteOutput = true;  // stop forwarding remaining audio from current response
+      } else {
+        log("PROXY", "Speech started");
       }
+      agentSpeaking = false;
 
     } else if (t === "input_audio_buffer.speech_stopped") {
       log("PROXY", "Speech stopped");
@@ -503,21 +508,25 @@ wss.on("connection", async (voxWs, req) => {
 
     // ── Agent audio output ──────────────────────────────────
     } else if (t === "response.output_audio.delta") {
-      agentSpeaking = true;  // FIX #2: mark agent as speaking
-      if (msg.delta) {
+      agentSpeaking = true;
+      // Only forward audio if not muted (barge-in)
+      if (!muteOutput && msg.delta) {
         sliceAndSendAudio(msg.delta);
       }
 
     // ── Response lifecycle ───────────────────────────────────
     } else if (t === "response.created") {
       agentSpeaking = true;
+      muteOutput = false;  // new response = unmute
 
     } else if (t === "response.done") {
-      agentSpeaking = false;  // FIX #2: agent finished speaking
+      agentSpeaking = false;
+      muteOutput = false;  // reset mute
       log("PROXY", `Response done (out=${outputChunks})`);
 
     } else if (t === "response.cancelled") {
-      agentSpeaking = false;  // FIX #2: agent was interrupted
+      agentSpeaking = false;
+      muteOutput = false;
       log("PROXY", "Response CANCELLED (barge-in)");
 
     // ── Function calling ────────────────────────────────────
@@ -558,6 +567,6 @@ wss.on("connection", async (voxWs, req) => {
 
 // ── Start server ────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`[yandex-realtime-proxy v12] listening on :${PORT}`);
+  console.log(`[yandex-realtime-proxy v12.1] listening on :${PORT}`);
   console.log(`[config] voice=${VOICE} vad_silence=${VAD_SILENCE_MS}ms vad_threshold=${VAD_THRESHOLD}`);
 });
