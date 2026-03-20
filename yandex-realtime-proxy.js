@@ -1,22 +1,16 @@
 // ============================================================
-// yandex-realtime-proxy.js
+// yandex-realtime-proxy.js v2
 // 
 // WebSocket-прокси: Voximplant ↔ Yandex AI Studio Realtime API
 //
-// Voximplant шлёт binary PCM 16kHz → прокси → base64 JSON → Яндекс
-// Яндекс шлёт response.output_audio.delta (base64) → прокси → binary PCM → Voximplant
-//
-// Function calls: прокси перехватывает, вызывает Edge Functions,
-// возвращает результат в Яндекс.
-// forward_to_manager: прокси отправляет JSON-событие в Voximplant,
-// VoxEngine делает PSTN-перевод.
+// v2: silence frames чтобы медиа-мост Voximplant не рвался
 // ============================================================
 
 const http = require("http");
 const { WebSocketServer, WebSocket } = require("ws");
 
 // ==== Конфигурация ====
-const PORT = process.env.PORT || 3100;
+const PORT = process.env.PORT || 10000;
 
 const YANDEX_API_KEY = process.env.YANDEX_API_KEY || "AQVN3AiYJ5UhCQtDCBHteaoaToa0DAauJ57diLhc";
 const YANDEX_FOLDER_ID = process.env.YANDEX_FOLDER_ID || "b1g9u208dq4eqnt8rn3i";
@@ -31,7 +25,10 @@ const SEND_INFO_URL = "https://nxtkthfhulkpaovilqlx.supabase.co/functions/v1/voi
 
 // Голос и аудио
 const VOICE = process.env.YANDEX_VOICE || "kirill";
-const AUDIO_RATE = 24000; // Яндекс работает на 24kHz
+const AUDIO_RATE = 24000;
+
+// Silence frame: 20ms тишины при 24kHz mono PCM16 = 480 samples * 2 bytes = 960 bytes
+const SILENCE_FRAME = Buffer.alloc(960);
 
 // ==== HTTP-сервер ====
 const server = http.createServer((req, res) => {
@@ -39,6 +36,7 @@ const server = http.createServer((req, res) => {
   res.end(JSON.stringify({
     status: "ok",
     service: "yandex-realtime-proxy",
+    version: "2.0",
     yandex_model: YANDEX_MODEL,
     voice: VOICE,
   }));
@@ -58,13 +56,35 @@ wss.on("connection", async (voxWs, req) => {
 
   let yandexWs = null;
   let yandexConnected = false;
+  let silenceInterval = null;
+  let gotFirstAudio = false;
   const audioBuffer = [];
+
+  // ── Сразу начинаем слать тишину в Voximplant ──
+  // Критично: без аудио-фреймов VoxEngine закрывает медиа-мост
+  silenceInterval = setInterval(() => {
+    if (voxWs.readyState === WebSocket.OPEN && !gotFirstAudio) {
+      voxWs.send(SILENCE_FRAME);
+    } else if (gotFirstAudio) {
+      clearInterval(silenceInterval);
+      silenceInterval = null;
+    }
+  }, 20);
+
+  // Таймаут: остановить тишину через 10 секунд в любом случае
+  const silenceTimeout = setTimeout(() => {
+    if (silenceInterval) {
+      clearInterval(silenceInterval);
+      silenceInterval = null;
+    }
+  }, 10000);
 
   // ── Подключение к Яндексу ──
   try {
     yandexWs = new WebSocket(YANDEX_WS_URL, { headers: YANDEX_HEADERS });
   } catch (err) {
     console.error("[PROXY] Failed to create Yandex WS:", err.message);
+    cleanup();
     voxWs.close(1011, "Yandex connection failed");
     return;
   }
@@ -89,6 +109,7 @@ wss.on("connection", async (voxWs, req) => {
       "Ты — Аврора, администратор студии массажа «Бохо Ритуал» в Санкт-Петербурге. " +
       "Твоя задача: записать клиента на приём, ответить на вопросы об услугах и ценах. " +
       "Отвечай кратко и дружелюбно. Говори естественно, как живой человек. " +
+      "Первая фраза: «Студия Бохо, добрый день! Слушаю вас.» " +
       "Если клиент хочет записаться — используй функцию get_available_slots для проверки свободного времени, " +
       "затем book_appointment для создания записи. " +
       "Если клиент просит отправить информацию — используй send_info. " +
@@ -199,21 +220,16 @@ wss.on("connection", async (voxWs, req) => {
 
   voxWs.on("message", (data, isBinary) => {
     if (isBinary) {
-      // Binary PCM from Voximplant → base64 JSON to Yandex
       if (yandexConnected) {
         sendAudioToYandex(Buffer.from(data));
       } else {
         audioBuffer.push(Buffer.from(data));
       }
     } else {
-      // Text message from VoxEngine (JSON commands)
       try {
         const cmd = JSON.parse(data.toString());
-        console.log("[PROXY] VoxEngine cmd:", cmd.type || cmd.action);
-        // Could handle contextualUpdate or other commands here
-      } catch (e) {
-        // Ignore non-JSON text
-      }
+        console.log("[PROXY] VoxEngine cmd:", cmd.type || cmd.action || "unknown");
+      } catch (e) {}
     }
   });
 
@@ -226,6 +242,13 @@ wss.on("connection", async (voxWs, req) => {
       // Аудио от агента → binary PCM в Voximplant
       if (msgType === "response.output_audio.delta") {
         if (msg.delta && voxWs.readyState === WebSocket.OPEN) {
+          if (!gotFirstAudio) {
+            gotFirstAudio = true;
+            if (silenceInterval) {
+              clearInterval(silenceInterval);
+              silenceInterval = null;
+            }
+          }
           const pcmBuf = Buffer.from(msg.delta, "base64");
           voxWs.send(pcmBuf);
         }
@@ -237,7 +260,6 @@ wss.on("connection", async (voxWs, req) => {
         const transcript = msg.transcript || "";
         if (transcript) {
           console.log(`[USER] ${transcript}`);
-          // Отправляем в VoxEngine для логирования
           safeSendJson(voxWs, { type: "user_transcript", text: transcript });
         }
         return;
@@ -250,7 +272,7 @@ wss.on("connection", async (voxWs, req) => {
         return;
       }
 
-      // Начало речи пользователя → очистить аудио-буфер
+      // Начало речи пользователя → прерывание
       if (msgType === "input_audio_buffer.speech_started") {
         console.log("[PROXY] Speech started — interruption");
         safeSendJson(voxWs, { type: "interruption" });
@@ -281,14 +303,36 @@ wss.on("connection", async (voxWs, req) => {
         return;
       }
 
+      // Ответ завершён — возобновляем тишину на паузу
+      if (msgType === "response.done") {
+        gotFirstAudio = false;
+        if (!silenceInterval) {
+          silenceInterval = setInterval(() => {
+            if (voxWs.readyState === WebSocket.OPEN && !gotFirstAudio) {
+              voxWs.send(SILENCE_FRAME);
+            } else {
+              clearInterval(silenceInterval);
+              silenceInterval = null;
+            }
+          }, 20);
+          setTimeout(() => {
+            if (silenceInterval) {
+              clearInterval(silenceInterval);
+              silenceInterval = null;
+            }
+          }, 10000);
+        }
+        return;
+      }
+
       // Ошибка
       if (msgType === "error") {
         console.error("[YANDEX ERROR]", JSON.stringify(msg, null, 2));
         return;
       }
 
-      // Другие события — логируем
-      if (!["response.created", "response.done", "response.output_item.added",
+      // Другие события
+      if (!["response.created", "response.output_item.added",
            "response.content_part.added", "response.content_part.done",
            "input_audio_buffer.committed", "input_audio_buffer.commit",
            "conversation.item.created"].includes(msgType)) {
@@ -300,10 +344,10 @@ wss.on("connection", async (voxWs, req) => {
     }
   });
 
-  // ── Обработка Function Calls ──
+  // ── Function Calls ──
   async function handleFunctionCall(item, yWs, vWs, phone) {
     const callId = item.call_id;
-    const funcName = item.name || (item.function || {}).name || "unknown";
+    const funcName = item.name || "unknown";
     const argsText = item.arguments || "{}";
 
     let args = {};
@@ -311,7 +355,6 @@ wss.on("connection", async (voxWs, req) => {
 
     console.log(`[TOOL] ${funcName}(${JSON.stringify(args)})`);
 
-    // forward_to_manager — отправляем в VoxEngine
     if (funcName === "forward_to_manager") {
       console.log("[TOOL] Forward to manager — sending to VoxEngine");
       safeSendJson(vWs, {
@@ -319,12 +362,10 @@ wss.on("connection", async (voxWs, req) => {
         reason: args.reason || "Клиент попросил администратора",
         call_id: callId,
       });
-      // Возвращаем результат в Яндекс
       sendFunctionResult(yWs, callId, JSON.stringify({ status: "transferring", message: "Переключаю на администратора" }));
       return;
     }
 
-    // Остальные функции — HTTP к Edge Functions
     let url = "";
     let body = {};
 
@@ -333,27 +374,16 @@ wss.on("connection", async (voxWs, req) => {
       body = { service: args.service, date: args.date };
     } else if (funcName === "book_appointment") {
       url = CREATE_BOOKING_URL;
-      body = {
-        service: args.service,
-        date: args.date,
-        time: args.time,
-        client_name: args.client_name,
-        client_phone: phone,
-      };
+      body = { service: args.service, date: args.date, time: args.time, client_name: args.client_name, client_phone: phone };
     } else if (funcName === "send_info") {
       url = SEND_INFO_URL;
-      body = {
-        channel: args.channel,
-        content_type: args.content_type,
-        phone: args.phone || phone,
-      };
+      body = { channel: args.channel, content_type: args.content_type, phone: args.phone || phone };
     } else {
       console.log(`[TOOL] Unknown function: ${funcName}`);
       sendFunctionResult(yWs, callId, JSON.stringify({ error: "Unknown function" }));
       return;
     }
 
-    // Вызов Edge Function
     try {
       const resp = await fetch(url, {
         method: "POST",
@@ -371,16 +401,10 @@ wss.on("connection", async (voxWs, req) => {
 
   function sendFunctionResult(yWs, callId, output) {
     if (yWs && yWs.readyState === WebSocket.OPEN) {
-      // 1. Отправляем результат
       yWs.send(JSON.stringify({
         type: "conversation.item.create",
-        item: {
-          type: "function_call_output",
-          call_id: callId,
-          output: output,
-        },
+        item: { type: "function_call_output", call_id: callId, output: output },
       }));
-      // 2. Запрашиваем продолжение ответа
       yWs.send(JSON.stringify({ type: "response.create" }));
       console.log(`[TOOL] Result sent, requested response.create`);
     }
@@ -392,31 +416,40 @@ wss.on("connection", async (voxWs, req) => {
     }
   }
 
+  function cleanup() {
+    if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
+    clearTimeout(silenceTimeout);
+  }
+
   // ── Закрытие соединений ──
-  voxWs.on("close", (code, reason) => {
+  voxWs.on("close", (code) => {
     console.log(`[PROXY] Voximplant disconnected: ${code}`);
+    cleanup();
     if (yandexWs && yandexWs.readyState === WebSocket.OPEN) yandexWs.close();
   });
 
   yandexWs.on("close", (code, reason) => {
     console.log(`[PROXY] Yandex disconnected: ${code} ${reason || ""}`);
+    cleanup();
     if (voxWs.readyState === WebSocket.OPEN) voxWs.close(code);
   });
 
   voxWs.on("error", (err) => {
     console.error("[PROXY] Voximplant WS error:", err.message);
+    cleanup();
     if (yandexWs && yandexWs.readyState === WebSocket.OPEN) yandexWs.close();
   });
 
   yandexWs.on("error", (err) => {
     console.error("[PROXY] Yandex WS error:", err.message);
+    cleanup();
     if (voxWs.readyState === WebSocket.OPEN) voxWs.close(1011, "Yandex error");
   });
 });
 
 // ==== Запуск ====
 server.listen(PORT, () => {
-  console.log(`[PROXY] Yandex Realtime proxy running on port ${PORT}`);
+  console.log(`[PROXY] Yandex Realtime proxy v2 running on port ${PORT}`);
   console.log(`[PROXY] Model: ${YANDEX_MODEL}`);
   console.log(`[PROXY] Voice: ${VOICE}`);
 });
