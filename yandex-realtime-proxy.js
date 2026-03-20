@@ -1,10 +1,8 @@
 // ============================================================
-// yandex-realtime-proxy.js v7
+// yandex-realtime-proxy.js v8
 // 
-// Правильно обрабатывает Voximplant Media Streaming протокол:
-// VoxEngine шлёт JSON: {"event":"media","media":{"payload":"base64pcm"}}
-// Прокси извлекает payload и пересылает в Яндекс
-// Яндекс шлёт base64 PCM → прокси оборачивает в JSON → VoxEngine
+// v8: аудио обратно в VoxEngine идёт как raw binary PCM
+//     (не JSON-обёртка) — VoxEngine ожидает бинарные фреймы
 // ============================================================
 
 const http = require("http");
@@ -22,14 +20,11 @@ const CREATE_BOOKING_URL = "https://nxtkthfhulkpaovilqlx.supabase.co/functions/v
 const SEND_INFO_URL = "https://nxtkthfhulkpaovilqlx.supabase.co/functions/v1/voice-agent-send-info";
 
 const VOICE = process.env.YANDEX_VOICE || "kirill";
-
-// Silence: 20ms тишины при 8kHz PCM16 = 160 samples * 2 bytes = 320 bytes → base64
-const SILENCE_PCM = Buffer.alloc(320);
-const SILENCE_B64 = SILENCE_PCM.toString("base64");
+const SILENCE_BIN = Buffer.alloc(320); // 20ms тишины при 8kHz PCM16
 
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", version: "7.0", model: YANDEX_MODEL, voice: VOICE }));
+  res.end(JSON.stringify({ status: "ok", version: "8.0", model: YANDEX_MODEL, voice: VOICE }));
 });
 
 const wss = new WebSocketServer({ server });
@@ -47,18 +42,13 @@ wss.on("connection", async (voxWs, req) => {
   let silenceInterval = null;
   let gotFirstAudio = false;
   let voxChunkCount = 0;
-  let outChunkCount = 0;
-  let voxSampleRate = 8000; // будет обновлён из start-события
-  const audioBuffer = []; // буфер до подключения Яндекса
+  let voxSampleRate = 8000;
+  const audioBuffer = [];
 
-  // ── Отправка тишины в VoxEngine (в их JSON формате) ──
+  // Тишина — raw binary PCM
   silenceInterval = setInterval(() => {
     if (voxWs.readyState === WebSocket.OPEN && !gotFirstAudio) {
-      outChunkCount++;
-      voxWs.send(JSON.stringify({
-        event: "media",
-        media: { chunk: outChunkCount, payload: SILENCE_B64 }
-      }));
+      voxWs.send(SILENCE_BIN);
     } else if (gotFirstAudio) {
       clearInterval(silenceInterval); silenceInterval = null;
     }
@@ -67,11 +57,11 @@ wss.on("connection", async (voxWs, req) => {
     if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
   }, 15000);
 
-  // ── Подключение к Яндексу ──
+  // Подключение к Яндексу
   try {
     yandexWs = new WebSocket(YANDEX_WS_URL, { headers: YANDEX_HEADERS });
   } catch (err) {
-    console.error("[PROXY] Yandex create failed:", err.message);
+    console.error("[PROXY] Yandex failed:", err.message);
     cleanup(); voxWs.close(1011); return;
   }
 
@@ -87,9 +77,6 @@ wss.on("connection", async (voxWs, req) => {
     ctx.push(mode === "inbound" ? "Входящий звонок." : "Исходящий звонок.");
     if (clientName) ctx.push(`Клиент: ${clientName}.`);
 
-    // Используем rate из start-события VoxEngine (обычно 8000)
-    const audioRate = voxSampleRate;
-
     yandexWs.send(JSON.stringify({
       type: "session.update",
       session: {
@@ -104,11 +91,11 @@ wss.on("connection", async (voxWs, req) => {
         output_modalities: ["audio"],
         audio: {
           input: {
-            format: { type: "audio/pcm", rate: audioRate, channels: 1 },
+            format: { type: "audio/pcm", rate: voxSampleRate, channels: 1 },
             turn_detection: { type: "server_vad", threshold: 0.5, silence_duration_ms: 400 },
           },
           output: {
-            format: { type: "audio/pcm", rate: audioRate },
+            format: { type: "audio/pcm", rate: voxSampleRate },
             voice: VOICE,
           },
         },
@@ -120,46 +107,32 @@ wss.on("connection", async (voxWs, req) => {
         ],
       },
     }));
-    console.log(`[PROXY] session.update sent (rate=${audioRate}, voice=${VOICE})`);
+    console.log(`[PROXY] session.update sent (rate=${voxSampleRate}, voice=${VOICE})`);
 
-    // Flush буфер
     while (audioBuffer.length > 0) {
-      const b64 = audioBuffer.shift();
-      yandexWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: b64 }));
+      yandexWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: audioBuffer.shift() }));
     }
   });
 
-  // ── VoxEngine → Яндекс ──
+  // VoxEngine → Яндекс (VoxEngine шлёт JSON media streaming)
   voxWs.on("message", (data) => {
     let msg;
-    try {
-      msg = JSON.parse(data.toString());
-    } catch (e) {
-      return; // Не JSON — игнорируем
-    }
+    try { msg = JSON.parse(data.toString()); } catch (e) { return; }
 
-    const event = msg.event;
-
-    // Событие start: читаем формат аудио
-    if (event === "start") {
+    if (msg.event === "start") {
       const fmt = (msg.start || {}).mediaFormat || {};
       voxSampleRate = fmt.sampleRate || 8000;
       console.log(`[VOX] Start: encoding=${fmt.encoding} rate=${voxSampleRate}`);
       return;
     }
 
-    // Событие media: извлекаем base64 PCM из payload
-    if (event === "media") {
+    if (msg.event === "media") {
       const payload = (msg.media || {}).payload;
       if (!payload) return;
-
       voxChunkCount++;
-      if (voxChunkCount <= 3) {
-        console.log(`[VOX] Media #${voxChunkCount}: payload=${payload.length} chars (base64)`);
-      }
+      if (voxChunkCount <= 3) console.log(`[VOX] Media #${voxChunkCount}: payload=${payload.length} chars`);
       if (voxChunkCount % 500 === 0) console.log(`[VOX] ${voxChunkCount} chunks`);
 
-      // payload уже base64 PCM — пересылаем напрямую в Яндекс!
       if (yandexConnected && yandexWs && yandexWs.readyState === WebSocket.OPEN) {
         yandexWs.send(JSON.stringify({ type: "input_audio_buffer.append", audio: payload }));
       } else {
@@ -168,36 +141,24 @@ wss.on("connection", async (voxWs, req) => {
       return;
     }
 
-    // Событие stop
-    if (event === "stop") {
-      console.log("[VOX] Stop event");
-      return;
-    }
-
-    // Неизвестное событие
-    console.log(`[VOX] Unknown event: ${event}`);
+    if (msg.event === "stop") { console.log("[VOX] Stop"); return; }
   });
 
-  // ── Яндекс → VoxEngine ──
+  // Яндекс → VoxEngine
   yandexWs.on("message", async (data) => {
     try {
       const msg = JSON.parse(data.toString());
       const t = msg.type;
 
-      // Аудио от агента → оборачиваем в VoxEngine media JSON
+      // Аудио — отправляем RAW BINARY PCM в VoxEngine
       if (t === "response.output_audio.delta") {
         if (msg.delta && voxWs.readyState === WebSocket.OPEN) {
           if (!gotFirstAudio) {
             gotFirstAudio = true;
-            console.log("[PROXY] First Yandex audio → VoxEngine");
+            console.log("[PROXY] First Yandex audio → VoxEngine (binary)");
             if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; }
           }
-          outChunkCount++;
-          // Оборачиваем base64 PCM в VoxEngine media JSON
-          voxWs.send(JSON.stringify({
-            event: "media",
-            media: { chunk: outChunkCount, payload: msg.delta }
-          }));
+          voxWs.send(Buffer.from(msg.delta, "base64"));
         }
         return;
       }
@@ -223,10 +184,8 @@ wss.on("connection", async (voxWs, req) => {
         gotFirstAudio = false;
         if (!silenceInterval) {
           silenceInterval = setInterval(() => {
-            if (voxWs.readyState === WebSocket.OPEN && !gotFirstAudio) {
-              outChunkCount++;
-              voxWs.send(JSON.stringify({ event: "media", media: { chunk: outChunkCount, payload: SILENCE_B64 } }));
-            } else { clearInterval(silenceInterval); silenceInterval = null; }
+            if (voxWs.readyState === WebSocket.OPEN && !gotFirstAudio) voxWs.send(SILENCE_BIN);
+            else { clearInterval(silenceInterval); silenceInterval = null; }
           }, 20);
           setTimeout(() => { if (silenceInterval) { clearInterval(silenceInterval); silenceInterval = null; } }, 10000);
         }
@@ -237,20 +196,19 @@ wss.on("connection", async (voxWs, req) => {
 
       if (!["response.created","response.output_item.added","response.content_part.added",
            "response.content_part.done","input_audio_buffer.committed","input_audio_buffer.commit",
-           "conversation.item.created"].includes(t)) {
+           "conversation.item.created","response.output_audio.done","response.output_text.done",
+           "response.output_audio_transcript.done","input_audio_buffer.speech_stopped"].includes(t)) {
         console.log(`[YA] ${t}`);
       }
     } catch (e) { console.error("[PROXY] parse:", e.message); }
   });
 
-  // ── Function calls ──
   async function handleFunc(item, yWs, vWs, phone) {
     const cid = item.call_id, fn = item.name || "?", at = item.arguments || "{}";
     let args = {}; try { args = JSON.parse(at); } catch(e) {}
     console.log(`[TOOL] ${fn}(${JSON.stringify(args)})`);
 
     if (fn === "forward_to_manager") {
-      // Отправляем команду в VoxEngine
       voxWs.send(JSON.stringify({ event: "command", command: "forward_to_manager", reason: args.reason || "" }));
       funcResult(yWs, cid, '{"status":"transferring"}');
       return;
@@ -283,10 +241,10 @@ wss.on("connection", async (voxWs, req) => {
     clearTimeout(silenceTimeout);
   }
 
-  voxWs.on("close", (c) => { console.log(`[PROXY] Vox dc: ${c}, in=${voxChunkCount} out=${outChunkCount}`); cleanup(); if (yandexWs && yandexWs.readyState === WebSocket.OPEN) yandexWs.close(); });
+  voxWs.on("close", (c) => { console.log(`[PROXY] Vox dc: ${c}, in=${voxChunkCount}`); cleanup(); if (yandexWs && yandexWs.readyState === WebSocket.OPEN) yandexWs.close(); });
   yandexWs.on("close", (c, r) => { console.log(`[PROXY] Ya dc: ${c} ${r||""}`); cleanup(); if (voxWs.readyState === WebSocket.OPEN) voxWs.close(c); });
   voxWs.on("error", () => { cleanup(); if (yandexWs && yandexWs.readyState === WebSocket.OPEN) yandexWs.close(); });
   yandexWs.on("error", () => { cleanup(); if (voxWs.readyState === WebSocket.OPEN) voxWs.close(1011); });
 });
 
-server.listen(PORT, () => { console.log(`[PROXY] v7 port=${PORT} voice=${VOICE}`); });
+server.listen(PORT, () => { console.log(`[PROXY] v8 port=${PORT} voice=${VOICE}`); });
