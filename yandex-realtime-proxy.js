@@ -1,20 +1,21 @@
 // ============================================================
-// yandex-realtime-proxy.js v12.3
+// yandex-realtime-proxy.js v12.5
 //
-// FIXES vs v12.2:
-// - Barge-in buffer flush: send 500ms of silence to VoxEngine to overwrite
-//   buffered agent audio (was: only stopped new frames, old ones kept playing)
-// FIXES vs v12.1:
-// - end_call loop fix: guard flag + don't send result back to Yandex
-// - cleanup guard: prevent multiple cleanup calls
-// FIXES vs v12:
-// - Removed response.cancel on barge-in (Yandex error: illegal in USER_SPEAKING)
-// FIXES vs v11:
-// 1. VAD: silence_duration_ms 400→800, threshold 0.5→0.6
-// 2. Barge-in: muteOutput + silence flush of VoxEngine buffer
-// 3. end_call tool with loop guard
-// 4. voice/role/speed config via env
-// 5. Better logging with timestamps
+// CRITICAL FIX: HALF-DUPLEX MODE
+// Root cause: proxy forwarded client audio to Yandex while agent was
+// still speaking (audio buffered in VoxEngine for 1-3 sec after generation).
+// Client spoke over agent → Yandex did barge-in → generated new response
+// → client hadn't heard old one → total chaos.
+//
+// Fix: don't forward client audio while isAgentAudible() is true.
+// Agent finishes speaking → 3 sec buffer drains → input unmutes → client speaks.
+//
+// Other fixes from v11→v12.x:
+// - VAD: silence_duration_ms 400→800, threshold 0.5→0.6
+// - end_call tool with loop guard (don't send result back to Yandex)
+// - cleanup guard (prevent multiple close calls)
+// - voice/role/speed config via env
+// - muteOutput for edge-case barge-in
 // ============================================================
 
 const http = require("http");
@@ -176,7 +177,7 @@ function log(tag, msg) {
 // ── HTTP server (health check + keep-alive) ─────────────────
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", version: "12.3", voice: VOICE, role: VOICE_ROLE, speed: VOICE_SPEED }));
+  res.end(JSON.stringify({ status: "ok", version: "12.5", voice: VOICE, role: VOICE_ROLE, speed: VOICE_SPEED }));
 });
 
 // ── WebSocket server ────────────────────────────────────────
@@ -198,6 +199,14 @@ wss.on("connection", async (voxWs, req) => {
   let agentSpeaking = false;      // FIX #2: track if agent is currently speaking
   let muteOutput = false;         // FIX #2: mute audio output after barge-in
   let endingCall = false;         // FIX: prevent end_call loop
+  let lastAudioSentAt = 0;       // FIX: track when last audio frame was sent to VoxEngine
+  
+  // VoxEngine has a playback buffer — agent may still be audible
+  // for up to 3 seconds after we stop sending frames
+  const PLAYBACK_BUFFER_MS = 3000;
+  function isAgentAudible() {
+    return agentSpeaking || (Date.now() - lastAudioSentAt < PLAYBACK_BUFFER_MS);
+  }
 
   // ── Connect to Yandex ───────────────────────────────────
   function connectYandex() {
@@ -263,6 +272,7 @@ wss.on("connection", async (voxWs, req) => {
       }
       sendMediaToVox(frameToSend.toString("base64"));
     }
+    lastAudioSentAt = Date.now();  // track for barge-in timing
     outputChunks++;
   }
 
@@ -418,6 +428,19 @@ wss.on("connection", async (voxWs, req) => {
       if (inputChunks <= 3) {
         log("VOX", `Media #${inputChunks}: ${msg.media?.payload?.length || 0} chars`);
       }
+      
+      // ── HALF-DUPLEX FIX ────────────────────────────────────
+      // Don't forward client audio while agent is still audible
+      // (VoxEngine plays buffered audio 1-3 sec after generation ends)
+      // This prevents: client speaks over agent → Yandex does barge-in
+      // → generates new response → client hasn't heard the old one → chaos
+      if (isAgentAudible()) {
+        if (inputChunks % 200 === 0) { // log every ~4 sec, not every frame
+          log("PROXY", `Input muted (agent audible, last audio ${Date.now() - lastAudioSentAt}ms ago)`);
+        }
+        return; // drop this frame — agent is still speaking
+      }
+      
       if (yaWs && yaWs.readyState === WebSocket.OPEN && msg.media?.payload) {
         yaWs.send(JSON.stringify({
           type: "input_audio_buffer.append",
@@ -502,19 +525,13 @@ wss.on("connection", async (voxWs, req) => {
       const toolCount = msg.session?.tools?.length || 0;
       log("PROXY", `Updated, tools=${toolCount}`);
 
-    // ── FIX #2: Barge-in ──────────────────────────────────
-    // Yandex handles barge-in internally (no response.cancel needed)
-    // We mute new audio AND flush VoxEngine playback buffer with silence
+    // ── Barge-in handler ──────────────────────────────────
+    // With half-duplex, this rarely fires (input muted while agent speaks)
+    // But keep as safety net for edge cases
     } else if (t === "input_audio_buffer.speech_started") {
       if (agentSpeaking) {
-        log("PROXY", ">>> BARGE-IN: muting + flushing VoxEngine buffer");
+        log("PROXY", ">>> BARGE-IN (rare in half-duplex mode)");
         muteOutput = true;
-        
-        // Flush VoxEngine playback buffer with ~500ms of silence (25 frames × 20ms)
-        // This overwrites any remaining agent audio sitting in VoxEngine's buffer
-        for (let i = 0; i < 25; i++) {
-          sendMediaToVox(SILENCE_B64);
-        }
       } else {
         log("PROXY", "Speech started");
       }
@@ -600,6 +617,6 @@ wss.on("connection", async (voxWs, req) => {
 
 // ── Start server ────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`[yandex-realtime-proxy v12.3] listening on :${PORT}`);
+  console.log(`[yandex-realtime-proxy v12.5] listening on :${PORT}`);
   console.log(`[config] voice=${VOICE} role=${VOICE_ROLE} speed=${VOICE_SPEED} vad_silence=${VAD_SILENCE_MS}ms vad_threshold=${VAD_THRESHOLD}`);
 });
