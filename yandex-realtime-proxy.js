@@ -1,14 +1,19 @@
 // ============================================================
-// yandex-realtime-proxy.js v12.1
+// yandex-realtime-proxy.js v12.3
 //
+// FIXES vs v12.2:
+// - Barge-in buffer flush: send 500ms of silence to VoxEngine to overwrite
+//   buffered agent audio (was: only stopped new frames, old ones kept playing)
+// FIXES vs v12.1:
+// - end_call loop fix: guard flag + don't send result back to Yandex
+// - cleanup guard: prevent multiple cleanup calls
 // FIXES vs v12:
-// - Removed response.cancel on barge-in (Yandex error: illegal in USER_SPEAKING state)
-// - Yandex handles barge-in internally; proxy just mutes audio forwarding
+// - Removed response.cancel on barge-in (Yandex error: illegal in USER_SPEAKING)
 // FIXES vs v11:
 // 1. VAD: silence_duration_ms 400→800, threshold 0.5→0.6
-// 2. Barge-in: muteOutput flag stops audio forwarding on speech_started
-// 3. end_call tool: agent can terminate the call
-// 4. Configurable voice via env (YANDEX_VOICE)
+// 2. Barge-in: muteOutput + silence flush of VoxEngine buffer
+// 3. end_call tool with loop guard
+// 4. voice/role/speed config via env
 // 5. Better logging with timestamps
 // ============================================================
 
@@ -171,7 +176,7 @@ function log(tag, msg) {
 // ── HTTP server (health check + keep-alive) ─────────────────
 const server = http.createServer((req, res) => {
   res.writeHead(200, { "Content-Type": "application/json" });
-  res.end(JSON.stringify({ status: "ok", version: "12.1", voice: VOICE, role: VOICE_ROLE, speed: VOICE_SPEED }));
+  res.end(JSON.stringify({ status: "ok", version: "12.3", voice: VOICE, role: VOICE_ROLE, speed: VOICE_SPEED }));
 });
 
 // ── WebSocket server ────────────────────────────────────────
@@ -192,7 +197,7 @@ wss.on("connection", async (voxWs, req) => {
   let sentStartToVox = false;
   let agentSpeaking = false;      // FIX #2: track if agent is currently speaking
   let muteOutput = false;         // FIX #2: mute audio output after barge-in
-  let pendingAudioQueue = [];     // FIX #2: queue for outgoing audio frames
+  let endingCall = false;         // FIX: prevent end_call loop
 
   // ── Connect to Yandex ───────────────────────────────────
   function connectYandex() {
@@ -263,6 +268,11 @@ wss.on("connection", async (voxWs, req) => {
 
   // ── Execute tool call (Edge Functions) ────────────────────
   async function executeTool(name, args, callId) {
+    // Block all tool calls if we're already ending
+    if (endingCall && name !== "end_call") {
+      log("TOOL", `Skipping ${name} — call is ending`);
+      return;
+    }
     log("TOOL", `Calling ${name} with ${JSON.stringify(args)}`);
     let result = { success: false, error: "Unknown tool" };
 
@@ -307,9 +317,15 @@ wss.on("connection", async (voxWs, req) => {
         result = { success: true, message: "Перевожу на менеджера" };
 
       } else if (name === "end_call") {
-        // FIX #3: Agent explicitly ends the call
+        // FIX: guard against infinite loop
+        if (endingCall) {
+          log("PROXY", "end_call already in progress, skipping");
+          return;  // don't send result back to Yandex
+        }
+        endingCall = true;
         log("PROXY", `end_call requested: ${args.reason}`);
-        // Give Yandex 1 second to finish speaking, then close
+        
+        // Give Yandex 2 seconds to finish speaking last phrase, then close
         setTimeout(() => {
           if (voxWs.readyState === WebSocket.OPEN) {
             voxWs.send(JSON.stringify({
@@ -317,12 +333,13 @@ wss.on("connection", async (voxWs, req) => {
               command: { type: "end_call", reason: args.reason }
             }));
           }
-          // Close connections after a brief delay for final audio
           setTimeout(() => {
             cleanup("end_call");
-          }, 2000);
-        }, 1500);
-        result = { success: true, message: "Звонок завершается" };
+          }, 1500);
+        }, 2000);
+        
+        // DON'T send result back to Yandex — this prevents the loop
+        return;
       }
     } catch (err) {
       log("TOOL", `Error: ${err.message}`);
@@ -346,8 +363,12 @@ wss.on("connection", async (voxWs, req) => {
   }
 
   // ── Cleanup ───────────────────────────────────────────────
+  let cleanedUp = false;
   function cleanup(reason) {
+    if (cleanedUp) return;
+    cleanedUp = true;
     log("PROXY", `Cleanup: ${reason}`);
+    stopSilenceTimer();
     if (yaWs && yaWs.readyState === WebSocket.OPEN) {
       yaWs.close(1000, reason);
     }
@@ -482,12 +503,18 @@ wss.on("connection", async (voxWs, req) => {
       log("PROXY", `Updated, tools=${toolCount}`);
 
     // ── FIX #2: Barge-in ──────────────────────────────────
-    // Yandex handles barge-in internally (unlike OpenAI which needs response.cancel)
-    // We just stop forwarding agent audio to VoxEngine so user hears silence
+    // Yandex handles barge-in internally (no response.cancel needed)
+    // We mute new audio AND flush VoxEngine playback buffer with silence
     } else if (t === "input_audio_buffer.speech_started") {
       if (agentSpeaking) {
-        log("PROXY", ">>> BARGE-IN: muting agent audio");
-        muteOutput = true;  // stop forwarding remaining audio from current response
+        log("PROXY", ">>> BARGE-IN: muting + flushing VoxEngine buffer");
+        muteOutput = true;
+        
+        // Flush VoxEngine playback buffer with ~500ms of silence (25 frames × 20ms)
+        // This overwrites any remaining agent audio sitting in VoxEngine's buffer
+        for (let i = 0; i < 25; i++) {
+          sendMediaToVox(SILENCE_B64);
+        }
       } else {
         log("PROXY", "Speech started");
       }
@@ -573,6 +600,6 @@ wss.on("connection", async (voxWs, req) => {
 
 // ── Start server ────────────────────────────────────────────
 server.listen(PORT, () => {
-  console.log(`[yandex-realtime-proxy v12.1] listening on :${PORT}`);
+  console.log(`[yandex-realtime-proxy v12.3] listening on :${PORT}`);
   console.log(`[config] voice=${VOICE} role=${VOICE_ROLE} speed=${VOICE_SPEED} vad_silence=${VAD_SILENCE_MS}ms vad_threshold=${VAD_THRESHOLD}`);
 });
