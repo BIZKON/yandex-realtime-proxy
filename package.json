@@ -1,0 +1,7 @@
+{
+  "name": "yandex-realtime-proxy",
+  "version": "1.0.0",
+  "main": "yandex-realtime-proxy.js",
+  "scripts": { "start": "node yandex-realtime-proxy.js" },
+  "dependencies": { "ws": "^8.18.0" }
+}
