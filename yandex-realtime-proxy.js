@@ -24,7 +24,7 @@ const CREATE_BOOKING_URL = "https://nxtkthfhulkpaovilqlx.supabase.co/functions/v
 const SEND_INFO_URL = "https://nxtkthfhulkpaovilqlx.supabase.co/functions/v1/voice-agent-send-info";
 
 const VOICE = process.env.YANDEX_VOICE || "kirill";
-const AUDIO_RATE = 24000;
+const AUDIO_RATE = 8000;
 const SILENCE_FRAME = Buffer.alloc(960); // 20ms тишины при 24kHz mono PCM16
 
 // ==== HTTP-сервер ====
